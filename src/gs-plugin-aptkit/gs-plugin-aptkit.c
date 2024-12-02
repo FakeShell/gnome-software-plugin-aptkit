@@ -1,0 +1,560 @@
+/*
+ * Copyright (C) 2025 Bardia Moshiri <bardia@furilabs.com>
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#include "gs-plugin-aptkit.h"
+#include <appstream.h>
+#include <glib/gi18n.h>
+#include <gnome-software.h>
+#include <gs-app-list.h>
+#include <gs-app-query.h>
+
+struct _GsPluginAptkit
+{
+  GsPlugin parent;
+
+  GDBusProxy *aptkit_proxy;  /* Proxy for Aptkit */
+  GsAppList *installed_apps;  /* List of installed apps */
+  GsAppList *updatable_apps;  /* List of apps with updates */
+};
+
+typedef struct {
+  GTask *task;
+  GsPluginAptkit *plugin;
+  gboolean simulate_only;  /* If TRUE, run Simulate, otherwise Run */
+} TransactionData;
+
+G_DEFINE_TYPE (GsPluginAptkit, gs_plugin_aptkit, GS_TYPE_PLUGIN);
+
+static void
+aptkit_proxy_setup_cb (GObject      *source_object,
+                       GAsyncResult *res,
+                       gpointer      user_data)
+{
+  g_autoptr (GTask) task = g_steal_pointer (&user_data);
+  GsPluginAptkit *self = g_task_get_source_object (task);
+  g_autoptr (GError) error = NULL;
+  GDBusProxy *proxy;
+
+  proxy = g_dbus_proxy_new_for_bus_finish (res, &error);
+  if (proxy == NULL) {
+    g_task_return_error (task, g_steal_pointer (&error));
+    return;
+  }
+
+  g_clear_object (&self->aptkit_proxy);
+  self->aptkit_proxy = proxy;
+
+  g_task_return_boolean (task, TRUE);
+}
+
+static gboolean
+gs_plugin_aptkit_setup_finish (GsPlugin *plugin,
+                               GAsyncResult *result,
+                               GError **error)
+{
+  return g_task_propagate_boolean (G_TASK (result), error);
+}
+
+static void
+gs_plugin_aptkit_setup_async (GsPlugin *plugin,
+                              GCancellable *cancellable,
+                              GAsyncReadyCallback callback,
+                              gpointer user_data)
+{
+  g_autoptr (GTask) task = NULL;
+
+  task = g_task_new (plugin, cancellable, callback, user_data);
+  g_task_set_source_tag (task, gs_plugin_aptkit_setup_async);
+
+  g_debug ("Aptkit plugin version: %s", GS_PLUGIN_APTKIT_VERSION);
+
+  g_dbus_proxy_new_for_bus (G_BUS_TYPE_SYSTEM,
+                            G_DBUS_PROXY_FLAGS_NONE,
+                            NULL,
+                            "org.aptkit",
+                            "/org/aptkit",
+                            "org.aptkit",
+                            cancellable,
+                            aptkit_proxy_setup_cb,
+                            g_steal_pointer (&task));
+}
+
+static gboolean
+gs_plugin_aptkit_refresh_metadata_finish (GsPlugin *plugin,
+                                          GAsyncResult *result,
+                                          GError **error)
+{
+  return g_task_propagate_boolean (G_TASK (result), error);
+}
+
+static void
+aptkit_process_packages (GsPluginAptkit *plugin,
+                         GsAppList *list,
+                         GVariant *packages,
+                         GVariant *dependencies)
+{
+  g_autoptr(GVariant) pkg_upgrades = NULL;
+  g_autoptr(GVariant) dep_upgrades = NULL;
+  GVariantIter iter;
+  const gchar *package_name;
+
+  gs_app_list_remove_all (plugin->updatable_apps);
+
+  /* Get the upgrades arrays (fifth element in both arrays) */
+  pkg_upgrades = g_variant_get_child_value (packages, 4);
+  dep_upgrades = g_variant_get_child_value (dependencies, 4);
+
+  g_variant_iter_init (&iter, pkg_upgrades);
+  while (g_variant_iter_next (&iter, "&s", &package_name)) {
+    g_autoptr(GsApp) app = NULL;
+
+    app = gs_app_new (package_name);
+    gs_app_set_kind (app, AS_COMPONENT_KIND_GENERIC);
+    gs_app_set_scope (app, AS_COMPONENT_SCOPE_SYSTEM);
+    gs_app_set_bundle_kind (app, AS_BUNDLE_KIND_PACKAGE);
+    gs_app_set_allow_cancel (app, FALSE);
+    gs_app_set_management_plugin (app, GS_PLUGIN (plugin));
+    gs_app_set_name (app, GS_APP_QUALITY_NORMAL, package_name);
+    gs_app_set_metadata (app, "aptkit::package-name", package_name);
+    gs_app_add_source (app, package_name);
+    gs_app_set_metadata (app, "GnomeSoftware::PackagingFormat", "deb");
+    gs_app_set_state (app, GS_APP_STATE_UPDATABLE_LIVE);
+    gs_app_add_kudo (app, GS_APP_KUDO_SANDBOXED_SECURE);
+
+    gs_app_list_add (list, app);
+    gs_app_list_add (plugin->updatable_apps, app);
+  }
+
+  g_variant_iter_init (&iter, dep_upgrades);
+  while (g_variant_iter_next (&iter, "&s", &package_name)) {
+    g_autoptr(GsApp) app = NULL;
+    g_auto(GStrv) parts = NULL;
+    const gchar *name;
+    const gchar *version;
+
+    /* Parse package name and version from format "name=version" */
+    parts = g_strsplit (package_name, "=", 2);
+    if (parts == NULL || parts[0] == NULL)
+      continue;
+
+    name = parts[0];
+    version = parts[1];
+
+    app = gs_app_new (name);
+    gs_app_set_kind (app, AS_COMPONENT_KIND_GENERIC);
+    gs_app_set_scope (app, AS_COMPONENT_SCOPE_SYSTEM);
+    gs_app_set_bundle_kind (app, AS_BUNDLE_KIND_PACKAGE);
+    gs_app_set_allow_cancel (app, FALSE);
+    gs_app_set_management_plugin (app, GS_PLUGIN (plugin));
+    gs_app_set_name (app, GS_APP_QUALITY_NORMAL, name);
+    gs_app_set_metadata (app, "aptkit::package-name", name);
+    gs_app_add_source (app, name);
+    gs_app_set_metadata (app, "GnomeSoftware::PackagingFormat", "deb");
+    gs_app_set_state (app, GS_APP_STATE_UPDATABLE_LIVE);
+    gs_app_add_kudo (app, GS_APP_KUDO_SANDBOXED_SECURE);
+
+    if (version != NULL)
+      gs_app_set_update_version (app, version);
+
+    gs_app_list_add (list, app);
+    gs_app_list_add (plugin->updatable_apps, app);
+  }
+}
+
+static void
+aptkit_transaction_signal_cb (GDBusProxy *proxy,
+                              const gchar *sender_name,
+                              const gchar *signal_name,
+                              GVariant *parameters,
+                              gpointer user_data)
+{
+  TransactionData *data = (TransactionData *)user_data;
+  g_debug ("Received signal: %s", signal_name);
+
+  if (g_strcmp0 (signal_name, "PropertyChanged") == 0) {
+    const gchar *property_name;
+    g_autoptr(GVariant) value = NULL;
+    g_variant_get (parameters, "(&sv)", &property_name, &value);
+    g_debug ("Property changed: %s", property_name);
+
+    if (g_strcmp0 (property_name, "ExitState") == 0) {
+      const gchar *exit_state;
+      g_variant_get (value, "&s", &exit_state);
+      g_debug ("Exit state changed to: %s", exit_state);
+
+      if (!data->simulate_only) {
+        if (g_strcmp0 (exit_state, "exit-success") == 0) {
+          g_task_return_boolean (data->task, TRUE);
+        } else if (g_strcmp0 (exit_state, "exit-cancelled") == 0) {
+          g_task_return_new_error (data->task,
+                                   GS_PLUGIN_ERROR,
+                                   GS_PLUGIN_ERROR_CANCELLED,
+                                   "Transaction was cancelled");
+        } else if (g_strcmp0 (exit_state, "exit-failed") == 0) {
+          g_task_return_new_error (data->task,
+                                   GS_PLUGIN_ERROR,
+                                   GS_PLUGIN_ERROR_FAILED,
+                                   "Transaction failed");
+        } else if (g_strcmp0 (exit_state, "exit-previous-failed") == 0) {
+          g_task_return_new_error (data->task,
+                                   GS_PLUGIN_ERROR,
+                                   GS_PLUGIN_ERROR_FAILED,
+                                   "Previous transaction failed");
+        }
+        g_object_unref (proxy);
+        g_free (data);
+      }
+    } else if (g_strcmp0 (property_name, "Packages") == 0 ||
+               g_strcmp0 (property_name, "Dependencies") == 0) {
+      g_autoptr(GVariant) packages = NULL;
+      g_autoptr(GVariant) dependencies = NULL;
+      g_autoptr(GsAppList) list = gs_app_list_new ();
+
+      /* Get both properties - one will be the 'value' parameter, get the other from proxy */
+      if (g_strcmp0 (property_name, "Packages") == 0) {
+        packages = g_variant_ref (value);
+        dependencies = g_dbus_proxy_get_cached_property (proxy, "Dependencies");
+      } else {
+        dependencies = g_variant_ref (value);
+        packages = g_dbus_proxy_get_cached_property (proxy, "Packages");
+      }
+
+      if (packages != NULL && dependencies != NULL) {
+        aptkit_process_packages (data->plugin, list, packages, dependencies);
+        if (data->simulate_only) {
+          g_task_return_pointer (data->task, g_steal_pointer (&list), g_object_unref);
+          g_object_unref (proxy);
+          g_free (data);
+        }
+        gs_plugin_updates_changed (GS_PLUGIN (data->plugin));
+      }
+    }
+  }
+}
+
+static void
+aptkit_transaction_run_cb (GObject *source_object,
+                           GAsyncResult *res,
+                           gpointer user_data)
+{
+  g_autoptr (GError) error = NULL;
+  g_autoptr (GVariant) result = NULL;
+
+  result = g_dbus_proxy_call_finish (G_DBUS_PROXY (source_object), res, &error);
+  if (result == NULL)
+    g_warning ("Failed to run transaction: %s", error->message);
+}
+
+static void
+aptkit_transaction_proxy_updates_cb (GObject *source_object,
+                                     GAsyncResult *res,
+                                     gpointer user_data)
+{
+  GTask *task = G_TASK (user_data);
+  g_autoptr (GError) error = NULL;
+  GDBusProxy *transaction_proxy;
+  TransactionData *data;
+
+  transaction_proxy = g_dbus_proxy_new_finish (res, &error);
+  if (transaction_proxy == NULL) {
+    g_task_return_error (task, g_steal_pointer (&error));
+    return;
+  }
+
+  data = g_new0 (TransactionData, 1);
+  data->task = task;
+  data->plugin = GS_PLUGIN_APTKIT (g_task_get_source_object (task));
+
+  g_signal_connect (transaction_proxy, "g-signal",
+                    G_CALLBACK (aptkit_transaction_signal_cb),
+                    data);
+
+  g_debug ("Calling %s on transaction", data->simulate_only ? "Simulate" : "Run");
+  g_dbus_proxy_call (transaction_proxy,
+                     data->simulate_only ? "Simulate" : "Run",
+                     g_variant_new ("()"),
+                     G_DBUS_CALL_FLAGS_NONE,
+                     -1,
+                     g_task_get_cancellable (task),
+                     aptkit_transaction_run_cb,
+                     NULL);
+}
+
+static void
+aptkit_update_cache_cb (GObject *source_object,
+                        GAsyncResult *res,
+                        gpointer user_data)
+{
+  GTask *task = G_TASK (user_data);
+  GsPluginAptkit *self = GS_PLUGIN_APTKIT (g_task_get_source_object (task));
+  g_autoptr (GError) error = NULL;
+  g_autoptr (GVariant) result = NULL;
+  const gchar *transaction_path;
+
+  result = g_dbus_proxy_call_finish (G_DBUS_PROXY (source_object), res, &error);
+  if (result == NULL) {
+    g_task_return_error (task, g_steal_pointer (&error));
+    return;
+  }
+
+  g_variant_get (result, "(&s)", &transaction_path);
+  g_debug ("Got transaction path: %s", transaction_path);
+
+  g_task_set_task_data (task, GINT_TO_POINTER (FALSE), NULL);
+  g_dbus_proxy_new (g_dbus_proxy_get_connection (self->aptkit_proxy),
+                    G_DBUS_PROXY_FLAGS_NONE,
+                    NULL,
+                    "org.aptkit",
+                    transaction_path,
+                    "org.aptkit.transaction",
+                    g_task_get_cancellable (task),
+                    aptkit_transaction_proxy_updates_cb,
+                    task);
+}
+
+static void
+gs_plugin_aptkit_refresh_metadata_async (GsPlugin *plugin,
+                                         guint64 cache_age_secs,
+                                         GsPluginRefreshMetadataFlags flags,
+                                         GCancellable *cancellable,
+                                         GAsyncReadyCallback callback,
+                                         gpointer user_data)
+{
+  GsPluginAptkit *self = GS_PLUGIN_APTKIT (plugin);
+  g_autoptr (GTask) task = NULL;
+
+  task = g_task_new (plugin, cancellable, callback, user_data);
+  g_task_set_source_tag (task, gs_plugin_aptkit_refresh_metadata_async);
+
+  g_debug ("Refreshing repositories");
+  gs_plugin_status_update (plugin, NULL, GS_PLUGIN_STATUS_DOWNLOADING);
+
+  g_dbus_proxy_call (self->aptkit_proxy,
+                     "UpdateCache",
+                     g_variant_new ("()"),
+                     G_DBUS_CALL_FLAGS_NONE,
+                     -1,
+                     cancellable,
+                     aptkit_update_cache_cb,
+                     g_steal_pointer (&task));
+}
+
+static void
+aptkit_upgrade_system_cb (GObject *source_object,
+                          GAsyncResult *res,
+                          gpointer user_data)
+{
+  GTask *task = G_TASK (user_data);
+  GsPluginAptkit *self = GS_PLUGIN_APTKIT (g_task_get_source_object (task));
+  g_autoptr (GError) error = NULL;
+  g_autoptr (GVariant) result = NULL;
+  const gchar *transaction_path;
+
+  result = g_dbus_proxy_call_finish (G_DBUS_PROXY (source_object), res, &error);
+  if (result == NULL) {
+    g_task_return_error (task, g_steal_pointer (&error));
+    return;
+  }
+
+  g_variant_get (result, "(&s)", &transaction_path);
+  g_debug ("Got transaction path: %s", transaction_path);
+
+  g_dbus_proxy_new (g_dbus_proxy_get_connection (self->aptkit_proxy),
+                    G_DBUS_PROXY_FLAGS_NONE,
+                    NULL,
+                    "org.aptkit",
+                    transaction_path,
+                    "org.aptkit.transaction",
+                    g_task_get_cancellable (task),
+                    aptkit_transaction_proxy_updates_cb,
+                    task);
+}
+
+static GsAppList *
+gs_plugin_aptkit_list_apps_finish (GsPlugin *plugin,
+                                   GAsyncResult *result,
+                                   GError **error)
+{
+  return g_task_propagate_pointer (G_TASK (result), error);
+}
+
+static void
+gs_plugin_aptkit_list_apps_async (GsPlugin *plugin,
+                                  GsAppQuery *query,
+                                  GsPluginListAppsFlags flags,
+                                  GCancellable *cancellable,
+                                  GAsyncReadyCallback callback,
+                                  gpointer user_data)
+{
+  GsPluginAptkit *self = GS_PLUGIN_APTKIT (plugin);
+  g_autoptr (GTask) task = NULL;
+  GsAppQueryTristate is_for_updates = GS_APP_QUERY_TRISTATE_UNSET;
+
+  task = g_task_new (plugin, cancellable, callback, user_data);
+  g_task_set_source_tag (task, gs_plugin_aptkit_list_apps_async);
+
+  if (query != NULL)
+    is_for_updates = gs_app_query_get_is_for_update (query);
+
+  /* Currently only support one query type at a time */
+  if (gs_app_query_get_n_properties_set (query) != 1 ||
+      is_for_updates == GS_APP_QUERY_TRISTATE_FALSE) {
+    g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
+                             "Unsupported query");
+    return;
+  }
+
+  if (is_for_updates == GS_APP_QUERY_TRISTATE_TRUE) {
+    g_debug ("Listing updates");
+
+    g_task_set_task_data (task, GINT_TO_POINTER (TRUE), NULL);  /* TRUE = simulate only */
+    g_dbus_proxy_call (self->aptkit_proxy,
+                       "UpgradeSystem",
+                       g_variant_new ("(b)", TRUE), /* safe mode */
+                       G_DBUS_CALL_FLAGS_NONE,
+                       -1,
+                       cancellable,
+                       aptkit_upgrade_system_cb,
+                       g_steal_pointer (&task));
+  } else {
+    g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
+                             "Unsupported query type");
+  }
+}
+
+static gboolean
+gs_plugin_aptkit_filter_desktop_file_cb (GsPlugin *plugin,
+                                         GsApp *app,
+                                         const gchar *filename,
+                                         GKeyFile *key_file,
+                                         gpointer user_data)
+{
+  return strstr (filename, "/snapd/") == NULL &&
+         strstr (filename, "/snap/") == NULL &&
+         strstr (filename, "/flatpak/") == NULL &&
+         g_key_file_has_group (key_file, "Desktop Entry") &&
+         !g_key_file_has_key (key_file, "Desktop Entry", "X-Flatpak", NULL) &&
+         !g_key_file_has_key (key_file, "Desktop Entry", "X-SnapInstanceName", NULL);
+}
+
+static gboolean
+gs_plugin_aptkit_launch_finish (GsPlugin *plugin,
+                                GAsyncResult *result,
+                                GError **error)
+{
+  return gs_plugin_app_launch_filtered_finish (plugin, result, error);
+}
+
+static void
+gs_plugin_aptkit_launch_async (GsPlugin *plugin,
+                               GsApp *app,
+                               GsPluginLaunchFlags flags,
+                               GCancellable *cancellable,
+                               GAsyncReadyCallback callback,
+                               gpointer user_data)
+
+{
+  gs_plugin_app_launch_filtered_async (plugin, app, flags, gs_plugin_aptkit_filter_desktop_file_cb, NULL, cancellable, callback, user_data);
+}
+
+static gboolean
+gs_plugin_aptkit_update_apps_finish (GsPlugin *plugin,
+                                     GAsyncResult *result,
+                                     GError **error)
+{
+  return g_task_propagate_boolean (G_TASK (result), error);
+}
+
+static void
+gs_plugin_aptkit_update_apps_async (GsPlugin *plugin,
+                                    GsAppList *list,
+                                    GsPluginUpdateAppsFlags flags,
+                                    GsPluginProgressCallback progress_callback,
+                                    gpointer progress_user_data,
+                                    GsPluginAppNeedsUserActionCallback app_needs_user_action_callback,
+                                    gpointer app_needs_user_action_data,
+                                    GCancellable *cancellable,
+                                    GAsyncReadyCallback callback,
+                                    gpointer user_data)
+{
+  GsPluginAptkit *self = GS_PLUGIN_APTKIT (plugin);
+  g_autoptr(GTask) task = NULL;
+
+  task = g_task_new (plugin, cancellable, callback, user_data);
+  g_task_set_source_tag (task, gs_plugin_aptkit_update_apps_async);
+
+  if (flags & GS_PLUGIN_UPDATE_APPS_FLAGS_NO_APPLY) {
+    g_task_return_boolean (task, TRUE);
+    return;
+  }
+
+  for (guint i = 0; i < gs_app_list_length (list); i++) {
+    GsApp *app = gs_app_list_index (list, i);
+    gs_app_set_state (app, GS_APP_STATE_INSTALLING);
+  }
+
+  g_task_set_task_data (task, GINT_TO_POINTER (FALSE), NULL);  /* FALSE = do actual update */
+
+  gs_plugin_status_update (plugin, NULL, GS_PLUGIN_STATUS_WAITING);
+
+  g_debug ("Starting system update");
+  g_dbus_proxy_call (self->aptkit_proxy,
+                     "UpgradeSystem",
+                     g_variant_new ("(b)", TRUE),  /* safe mode */
+                     G_DBUS_CALL_FLAGS_NONE,
+                     -1,
+                     cancellable,
+                     aptkit_upgrade_system_cb,
+                     g_steal_pointer (&task));
+}
+
+static void
+gs_plugin_aptkit_init (GsPluginAptkit *self)
+{
+  GsPlugin *plugin = GS_PLUGIN (self);
+
+  gs_plugin_add_rule (plugin, GS_PLUGIN_RULE_RUN_BEFORE, "icons");
+  gs_plugin_add_rule (plugin, GS_PLUGIN_RULE_RUN_BEFORE, "generic-updates");
+
+  self->updatable_apps = gs_app_list_new ();
+}
+
+static void
+gs_plugin_aptkit_dispose (GObject *object)
+{
+  GsPluginAptkit *self = GS_PLUGIN_APTKIT (object);
+
+  g_clear_object (&self->aptkit_proxy);
+  g_clear_object (&self->updatable_apps);
+
+  G_OBJECT_CLASS (gs_plugin_aptkit_parent_class)->dispose (object);
+}
+
+static void
+gs_plugin_aptkit_class_init (GsPluginAptkitClass *klass)
+{
+  GObjectClass *object_class = G_OBJECT_CLASS (klass);
+  GsPluginClass *plugin_class = GS_PLUGIN_CLASS (klass);
+
+  object_class->dispose = gs_plugin_aptkit_dispose;
+
+  plugin_class->setup_async = gs_plugin_aptkit_setup_async;
+  plugin_class->setup_finish = gs_plugin_aptkit_setup_finish;
+  plugin_class->refresh_metadata_async = gs_plugin_aptkit_refresh_metadata_async;
+  plugin_class->refresh_metadata_finish = gs_plugin_aptkit_refresh_metadata_finish;
+  plugin_class->list_apps_async = gs_plugin_aptkit_list_apps_async;
+  plugin_class->list_apps_finish = gs_plugin_aptkit_list_apps_finish;
+  plugin_class->launch_async = gs_plugin_aptkit_launch_async;
+  plugin_class->launch_finish = gs_plugin_aptkit_launch_finish;
+  plugin_class->update_apps_async = gs_plugin_aptkit_update_apps_async;
+  plugin_class->update_apps_finish = gs_plugin_aptkit_update_apps_finish;
+}
+
+GType
+gs_plugin_query_type (void)
+{
+  return GS_TYPE_PLUGIN_APTKIT;
+}

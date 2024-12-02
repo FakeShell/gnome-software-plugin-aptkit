@@ -1,0 +1,22 @@
+Source: gnome-software-plugin-aptkit
+Maintainer: Bardia Moshiri <bardia@furilabs.com>
+Section: misc
+Priority: optional
+Build-Depends: debhelper-compat (= 13),
+               libglib2.0-dev,
+               pkg-config,
+               gnome-software-dev,
+               gnome-software,
+               libappstream-dev,
+               meson,
+Standards-Version: 4.7.0
+Vcs-Browser: https://github.com/furilabs/gnome-software-plugin-aptkit
+Vcs-Git: https://github.com/furilabs/gnome-software-plugin-aptkit.git
+
+Package: gnome-software-plugin-aptkit
+Architecture: any
+Depends: ${misc:Depends}, ${shlibs:Depends},
+         libglib2.0-0t64,
+         appstream,
+         gnome-software-common,
+Description: Allow to install Debian packages through Aptkit in GNOME software
