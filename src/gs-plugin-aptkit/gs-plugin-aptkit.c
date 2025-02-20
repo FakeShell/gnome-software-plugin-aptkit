@@ -16,7 +16,6 @@ struct _GsPluginAptkit
   GsPlugin parent;
 
   GDBusProxy *aptkit_proxy;  /* Proxy for Aptkit */
-  GsAppList *installed_apps;  /* List of installed apps */
   GsAppList *updatable_apps;  /* List of apps with updates */
 };
 
@@ -98,15 +97,22 @@ aptkit_process_packages (GsPluginAptkit *plugin,
 {
   g_autoptr(GVariant) pkg_upgrades = NULL;
   g_autoptr(GVariant) dep_upgrades = NULL;
+  g_autoptr(GVariant) pkg_downgrades = NULL;
+  g_autoptr(GVariant) dep_downgrades = NULL;
   GVariantIter iter;
   const gchar *package_name;
 
   gs_app_list_remove_all (plugin->updatable_apps);
 
-  /* Get the upgrades arrays (fifth element in both arrays) */
+  /* Get the upgrades arrays (fifth element) */
   pkg_upgrades = g_variant_get_child_value (packages, 4);
   dep_upgrades = g_variant_get_child_value (dependencies, 4);
 
+  /* Get the downgrades arrays (sixth element, index 5) */
+  pkg_downgrades = g_variant_get_child_value (packages, 5);
+  dep_downgrades = g_variant_get_child_value (dependencies, 5);
+
+  /* Process upgrades */
   g_variant_iter_init (&iter, pkg_upgrades);
   while (g_variant_iter_next (&iter, "&s", &package_name)) {
     g_autoptr(GsApp) app = NULL;
@@ -128,7 +134,8 @@ aptkit_process_packages (GsPluginAptkit *plugin,
     gs_app_list_add (plugin->updatable_apps, app);
   }
 
-  g_variant_iter_init (&iter, dep_upgrades);
+  /* Process package downgrades */
+  g_variant_iter_init (&iter, pkg_downgrades);
   while (g_variant_iter_next (&iter, "&s", &package_name)) {
     g_autoptr(GsApp) app = NULL;
     g_auto(GStrv) parts = NULL;
@@ -136,6 +143,76 @@ aptkit_process_packages (GsPluginAptkit *plugin,
     const gchar *version;
 
     /* Parse package name and version from format "name=version" */
+    parts = g_strsplit (package_name, "=", 2);
+    if (parts == NULL || parts[0] == NULL)
+      continue;
+
+    name = parts[0];
+    version = parts[1];
+
+    app = gs_app_new (name);
+    gs_app_set_kind (app, AS_COMPONENT_KIND_GENERIC);
+    gs_app_set_scope (app, AS_COMPONENT_SCOPE_SYSTEM);
+    gs_app_set_bundle_kind (app, AS_BUNDLE_KIND_PACKAGE);
+    gs_app_set_allow_cancel (app, FALSE);
+    gs_app_set_management_plugin (app, GS_PLUGIN (plugin));
+    gs_app_set_name (app, GS_APP_QUALITY_NORMAL, name);
+    gs_app_set_metadata (app, "aptkit::package-name", name);
+    gs_app_add_source (app, name);
+    gs_app_set_metadata (app, "GnomeSoftware::PackagingFormat", "deb");
+    gs_app_set_state (app, GS_APP_STATE_UPDATABLE_LIVE);
+    gs_app_add_kudo (app, GS_APP_KUDO_SANDBOXED_SECURE);
+
+    if (version != NULL)
+      gs_app_set_update_version (app, version);
+
+    gs_app_list_add (list, app);
+    gs_app_list_add (plugin->updatable_apps, app);
+  }
+
+  /* Process dependency upgrades */
+  g_variant_iter_init (&iter, dep_upgrades);
+  while (g_variant_iter_next (&iter, "&s", &package_name)) {
+    g_autoptr(GsApp) app = NULL;
+    g_auto(GStrv) parts = NULL;
+    const gchar *name;
+    const gchar *version;
+
+    parts = g_strsplit (package_name, "=", 2);
+    if (parts == NULL || parts[0] == NULL)
+      continue;
+
+    name = parts[0];
+    version = parts[1];
+
+    app = gs_app_new (name);
+    gs_app_set_kind (app, AS_COMPONENT_KIND_GENERIC);
+    gs_app_set_scope (app, AS_COMPONENT_SCOPE_SYSTEM);
+    gs_app_set_bundle_kind (app, AS_BUNDLE_KIND_PACKAGE);
+    gs_app_set_allow_cancel (app, FALSE);
+    gs_app_set_management_plugin (app, GS_PLUGIN (plugin));
+    gs_app_set_name (app, GS_APP_QUALITY_NORMAL, name);
+    gs_app_set_metadata (app, "aptkit::package-name", name);
+    gs_app_add_source (app, name);
+    gs_app_set_metadata (app, "GnomeSoftware::PackagingFormat", "deb");
+    gs_app_set_state (app, GS_APP_STATE_UPDATABLE_LIVE);
+    gs_app_add_kudo (app, GS_APP_KUDO_SANDBOXED_SECURE);
+
+    if (version != NULL)
+      gs_app_set_update_version (app, version);
+
+    gs_app_list_add (list, app);
+    gs_app_list_add (plugin->updatable_apps, app);
+  }
+
+  /* Process dependency downgrades */
+  g_variant_iter_init (&iter, dep_downgrades);
+  while (g_variant_iter_next (&iter, "&s", &package_name)) {
+    g_autoptr(GsApp) app = NULL;
+    g_auto(GStrv) parts = NULL;
+    const gchar *name;
+    const gchar *version;
+
     parts = g_strsplit (package_name, "=", 2);
     if (parts == NULL || parts[0] == NULL)
       continue;
@@ -185,28 +262,26 @@ aptkit_transaction_signal_cb (GDBusProxy *proxy,
       g_variant_get (value, "&s", &exit_state);
       g_debug ("Exit state changed to: %s", exit_state);
 
-      if (!data->simulate_only) {
-        if (g_strcmp0 (exit_state, "exit-success") == 0) {
-          g_task_return_boolean (data->task, TRUE);
-        } else if (g_strcmp0 (exit_state, "exit-cancelled") == 0) {
-          g_task_return_new_error (data->task,
-                                   GS_PLUGIN_ERROR,
-                                   GS_PLUGIN_ERROR_CANCELLED,
-                                   "Transaction was cancelled");
-        } else if (g_strcmp0 (exit_state, "exit-failed") == 0) {
-          g_task_return_new_error (data->task,
-                                   GS_PLUGIN_ERROR,
-                                   GS_PLUGIN_ERROR_FAILED,
-                                   "Transaction failed");
-        } else if (g_strcmp0 (exit_state, "exit-previous-failed") == 0) {
-          g_task_return_new_error (data->task,
-                                   GS_PLUGIN_ERROR,
-                                   GS_PLUGIN_ERROR_FAILED,
-                                   "Previous transaction failed");
-        }
-        g_object_unref (proxy);
-        g_free (data);
+      if (g_strcmp0 (exit_state, "exit-success") == 0) {
+        g_task_return_boolean (data->task, TRUE);
+      } else if (g_strcmp0 (exit_state, "exit-cancelled") == 0) {
+        g_task_return_new_error (data->task,
+                                 GS_PLUGIN_ERROR,
+                                 GS_PLUGIN_ERROR_CANCELLED,
+                                 "Transaction was cancelled");
+      } else if (g_strcmp0 (exit_state, "exit-failed") == 0) {
+        g_task_return_new_error (data->task,
+                                 GS_PLUGIN_ERROR,
+                                 GS_PLUGIN_ERROR_FAILED,
+                                 "Transaction failed");
+      } else if (g_strcmp0 (exit_state, "exit-previous-failed") == 0) {
+        g_task_return_new_error (data->task,
+                                 GS_PLUGIN_ERROR,
+                                 GS_PLUGIN_ERROR_FAILED,
+                                 "Previous transaction failed");
       }
+      g_object_unref (proxy);
+      g_free (data);
     } else if (g_strcmp0 (property_name, "Packages") == 0 ||
                g_strcmp0 (property_name, "Dependencies") == 0) {
       g_autoptr(GVariant) packages = NULL;
@@ -267,6 +342,7 @@ aptkit_transaction_proxy_updates_cb (GObject *source_object,
   data = g_new0 (TransactionData, 1);
   data->task = task;
   data->plugin = GS_PLUGIN_APTKIT (g_task_get_source_object (task));
+  data->simulate_only = GPOINTER_TO_INT (g_task_get_task_data (task));
 
   g_signal_connect (transaction_proxy, "g-signal",
                     G_CALLBACK (aptkit_transaction_signal_cb),
