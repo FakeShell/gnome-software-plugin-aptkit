@@ -11,6 +11,12 @@
 #include <gs-app-list.h>
 #include <gs-app-query.h>
 
+typedef enum {
+  ACTION_UPDATE_CACHE,
+  ACTION_UPGRADE_SYSTEM,
+  ACTION_LIST_UPDATES
+} TransactionAction;
+
 struct _GsPluginAptkit
 {
   GsPlugin parent;
@@ -22,7 +28,7 @@ struct _GsPluginAptkit
 typedef struct {
   GTask *task;
   GsPluginAptkit *plugin;
-  gboolean simulate_only;  /* If TRUE, run Simulate, otherwise Run */
+  TransactionAction action;
 } TransactionData;
 
 G_DEFINE_TYPE (GsPluginAptkit, gs_plugin_aptkit, GS_TYPE_PLUGIN);
@@ -263,6 +269,18 @@ aptkit_transaction_signal_cb (GDBusProxy *proxy,
       g_debug ("Exit state changed to: %s", exit_state);
 
       if (g_strcmp0 (exit_state, "exit-success") == 0) {
+        /* we only need to emit updates changed on cache update or system upgrade */
+        if (data->action == ACTION_UPGRADE_SYSTEM) {
+          for (guint i = 0; i < gs_app_list_length (data->plugin->updatable_apps); i++) {
+            GsApp *app = gs_app_list_index (data->plugin->updatable_apps, i);
+            gs_app_set_state (app, GS_APP_STATE_INSTALLED);
+          }
+
+          gs_plugin_updates_changed (GS_PLUGIN (data->plugin));
+        } else if (data->action == ACTION_UPDATE_CACHE) {
+          gs_plugin_updates_changed (GS_PLUGIN (data->plugin));
+        }
+
         g_task_return_boolean (data->task, TRUE);
       } else if (g_strcmp0 (exit_state, "exit-cancelled") == 0) {
         g_task_return_new_error (data->task,
@@ -299,12 +317,11 @@ aptkit_transaction_signal_cb (GDBusProxy *proxy,
 
       if (packages != NULL && dependencies != NULL) {
         aptkit_process_packages (data->plugin, list, packages, dependencies);
-        if (data->simulate_only) {
+        if (data->action == ACTION_LIST_UPDATES) {
           g_task_return_pointer (data->task, g_steal_pointer (&list), g_object_unref);
           g_object_unref (proxy);
           g_free (data);
         }
-        gs_plugin_updates_changed (GS_PLUGIN (data->plugin));
       }
     }
   }
@@ -342,15 +359,17 @@ aptkit_transaction_proxy_updates_cb (GObject *source_object,
   data = g_new0 (TransactionData, 1);
   data->task = task;
   data->plugin = GS_PLUGIN_APTKIT (g_task_get_source_object (task));
-  data->simulate_only = GPOINTER_TO_INT (g_task_get_task_data (task));
+  data->action = GPOINTER_TO_INT (g_task_get_task_data (task));
 
   g_signal_connect (transaction_proxy, "g-signal",
                     G_CALLBACK (aptkit_transaction_signal_cb),
                     data);
 
-  g_debug ("Calling %s on transaction", data->simulate_only ? "Simulate" : "Run");
+  const gchar *method = (data->action == ACTION_LIST_UPDATES) ? "Simulate" : "Run";
+  g_debug ("Calling %s on transaction for action %d", method, data->action);
+
   g_dbus_proxy_call (transaction_proxy,
-                     data->simulate_only ? "Simulate" : "Run",
+                     method,
                      g_variant_new ("()"),
                      G_DBUS_CALL_FLAGS_NONE,
                      -1,
@@ -379,7 +398,7 @@ aptkit_update_cache_cb (GObject *source_object,
   g_variant_get (result, "(&s)", &transaction_path);
   g_debug ("Got transaction path: %s", transaction_path);
 
-  g_task_set_task_data (task, GINT_TO_POINTER (FALSE), NULL);
+  g_task_set_task_data (task, GINT_TO_POINTER (ACTION_UPDATE_CACHE), NULL);
   g_dbus_proxy_new (g_dbus_proxy_get_connection (self->aptkit_proxy),
                     G_DBUS_PROXY_FLAGS_NONE,
                     NULL,
@@ -486,7 +505,7 @@ gs_plugin_aptkit_list_apps_async (GsPlugin *plugin,
   if (is_for_updates == GS_APP_QUERY_TRISTATE_TRUE) {
     g_debug ("Listing updates");
 
-    g_task_set_task_data (task, GINT_TO_POINTER (TRUE), NULL);  /* TRUE = simulate only */
+    g_task_set_task_data (task, GINT_TO_POINTER (ACTION_LIST_UPDATES), NULL);
     g_dbus_proxy_call (self->aptkit_proxy,
                        "UpgradeSystem",
                        g_variant_new ("(b)", TRUE), /* safe mode */
@@ -567,14 +586,16 @@ gs_plugin_aptkit_update_apps_async (GsPlugin *plugin,
     return;
   }
 
+  gs_plugin_status_update (plugin, NULL, GS_PLUGIN_STATUS_WAITING);
+
+  gs_app_list_remove_all (self->updatable_apps);
   for (guint i = 0; i < gs_app_list_length (list); i++) {
     GsApp *app = gs_app_list_index (list, i);
     gs_app_set_state (app, GS_APP_STATE_INSTALLING);
+    gs_app_list_add (self->updatable_apps, app);
   }
 
-  g_task_set_task_data (task, GINT_TO_POINTER (FALSE), NULL);  /* FALSE = do actual update */
-
-  gs_plugin_status_update (plugin, NULL, GS_PLUGIN_STATUS_WAITING);
+  g_task_set_task_data (task, GINT_TO_POINTER (ACTION_UPGRADE_SYSTEM), NULL);
 
   g_debug ("Starting system update");
   g_dbus_proxy_call (self->aptkit_proxy,
