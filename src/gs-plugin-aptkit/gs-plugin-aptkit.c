@@ -273,7 +273,11 @@ aptkit_transaction_signal_cb (GDBusProxy *proxy,
         if (data->action == ACTION_UPGRADE_SYSTEM) {
           for (guint i = 0; i < gs_app_list_length (data->plugin->updatable_apps); i++) {
             GsApp *app = gs_app_list_index (data->plugin->updatable_apps, i);
-            gs_app_set_state (app, GS_APP_STATE_INSTALLED);
+            const gchar *package_name = gs_app_get_metadata_item (app, "aptkit::package-name");
+            if (package_name != NULL) {
+              g_debug ("Upgraded package: %s", package_name);
+              gs_app_set_state (app, GS_APP_STATE_INSTALLED);
+            }
           }
 
           gs_plugin_updates_changed (GS_PLUGIN (data->plugin));
@@ -591,8 +595,12 @@ gs_plugin_aptkit_update_apps_async (GsPlugin *plugin,
   gs_app_list_remove_all (self->updatable_apps);
   for (guint i = 0; i < gs_app_list_length (list); i++) {
     GsApp *app = gs_app_list_index (list, i);
-    gs_app_set_state (app, GS_APP_STATE_INSTALLING);
-    gs_app_list_add (self->updatable_apps, app);
+    const gchar *package_name = gs_app_get_metadata_item (app, "aptkit::package-name");
+    if (package_name != NULL) {
+      g_debug ("Adding package to upgrade: %s", package_name);
+      gs_app_list_add (self->updatable_apps, app);
+      gs_app_set_state (app, GS_APP_STATE_INSTALLING);
+    }
   }
 
   g_task_set_task_data (task, GINT_TO_POINTER (ACTION_UPGRADE_SYSTEM), NULL);
