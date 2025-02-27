@@ -23,15 +23,22 @@ struct _GsPluginAptkit
 
   GDBusProxy *aptkit_proxy;  /* Proxy for Aptkit */
   GsAppList *updatable_apps;  /* List of apps with updates */
+  gboolean tried_safe_mode;  /* Flag to track if safe mode has been tried */
 };
 
 typedef struct {
   GTask *task;
   GsPluginAptkit *plugin;
   TransactionAction action;
+  gboolean safe_mode;  /* Flag to indicate if safe mode is enabled */
 } TransactionData;
 
 G_DEFINE_TYPE (GsPluginAptkit, gs_plugin_aptkit, GS_TYPE_PLUGIN);
+
+static void
+aptkit_upgrade_system_cb (GObject *source_object,
+                          GAsyncResult *res,
+                          gpointer user_data);
 
 static void
 aptkit_proxy_setup_cb (GObject      *source_object,
@@ -95,7 +102,7 @@ gs_plugin_aptkit_refresh_metadata_finish (GsPlugin *plugin,
   return g_task_propagate_boolean (G_TASK (result), error);
 }
 
-static void
+static gboolean
 aptkit_process_packages (GsPluginAptkit *plugin,
                          GsAppList *list,
                          GVariant *packages,
@@ -107,6 +114,7 @@ aptkit_process_packages (GsPluginAptkit *plugin,
   g_autoptr(GVariant) dep_downgrades = NULL;
   GVariantIter iter;
   const gchar *package_name;
+  gboolean added_any_packages = FALSE;
 
   gs_app_list_remove_all (plugin->updatable_apps);
 
@@ -138,6 +146,7 @@ aptkit_process_packages (GsPluginAptkit *plugin,
 
     gs_app_list_add (list, app);
     gs_app_list_add (plugin->updatable_apps, app);
+    added_any_packages = TRUE;
   }
 
   /* Process package downgrades */
@@ -174,6 +183,7 @@ aptkit_process_packages (GsPluginAptkit *plugin,
 
     gs_app_list_add (list, app);
     gs_app_list_add (plugin->updatable_apps, app);
+    added_any_packages = TRUE;
   }
 
   /* Process dependency upgrades */
@@ -209,6 +219,7 @@ aptkit_process_packages (GsPluginAptkit *plugin,
 
     gs_app_list_add (list, app);
     gs_app_list_add (plugin->updatable_apps, app);
+    added_any_packages = TRUE;
   }
 
   /* Process dependency downgrades */
@@ -244,7 +255,10 @@ aptkit_process_packages (GsPluginAptkit *plugin,
 
     gs_app_list_add (list, app);
     gs_app_list_add (plugin->updatable_apps, app);
+    added_any_packages = TRUE;
   }
+
+  return added_any_packages;
 }
 
 static void
@@ -320,11 +334,37 @@ aptkit_transaction_signal_cb (GDBusProxy *proxy,
       }
 
       if (packages != NULL && dependencies != NULL) {
-        aptkit_process_packages (data->plugin, list, packages, dependencies);
+        gboolean has_packages = aptkit_process_packages (data->plugin, list, packages, dependencies);
         if (data->action == ACTION_LIST_UPDATES) {
-          g_task_return_pointer (data->task, g_steal_pointer (&list), g_object_unref);
-          g_object_unref (proxy);
-          g_free (data);
+          if (!has_packages && data->safe_mode && !data->plugin->tried_safe_mode) {
+            /* If no packages found in safe mode, try without safe mode */
+            data->plugin->tried_safe_mode = TRUE;
+            g_debug ("No updates found in safe mode, trying without safe mode");
+
+            /* Store needed references before freeing data */
+            GTask *original_task = data->task;
+            GDBusProxy *aptkit_proxy = data->plugin->aptkit_proxy;
+            GCancellable *cancellable = g_task_get_cancellable (original_task);
+
+            /* We need to clean up the current transaction before starting a new one */
+            g_object_unref (proxy);
+            g_free (data);
+
+            /* Try listing updates without safe mode */
+            g_dbus_proxy_call (aptkit_proxy,
+                               "UpgradeSystem",
+                               g_variant_new ("(b)", FALSE), /* safe mode off */
+                               G_DBUS_CALL_FLAGS_NONE,
+                               -1,
+                               cancellable,
+                               aptkit_upgrade_system_cb,
+                               original_task);
+          } else {
+            /* Whether we found packages or not, return the list (which might be empty) */
+            g_task_return_pointer (data->task, g_steal_pointer (&list), g_object_unref);
+            g_object_unref (proxy);
+            g_free (data);
+          }
         }
       }
     }
@@ -364,13 +404,15 @@ aptkit_transaction_proxy_updates_cb (GObject *source_object,
   data->task = task;
   data->plugin = GS_PLUGIN_APTKIT (g_task_get_source_object (task));
   data->action = GPOINTER_TO_INT (g_task_get_task_data (task));
+  data->safe_mode = GPOINTER_TO_INT (g_object_get_data (G_OBJECT (task), "safe-mode"));
 
   g_signal_connect (transaction_proxy, "g-signal",
                     G_CALLBACK (aptkit_transaction_signal_cb),
                     data);
 
   const gchar *method = (data->action == ACTION_LIST_UPDATES) ? "Simulate" : "Run";
-  g_debug ("Calling %s on transaction for action %d", method, data->action);
+  g_debug ("Calling %s on transaction for action %d with safe mode %d",
+           method, data->action, data->safe_mode);
 
   g_dbus_proxy_call (transaction_proxy,
                      method,
@@ -495,6 +537,9 @@ gs_plugin_aptkit_list_apps_async (GsPlugin *plugin,
   task = g_task_new (plugin, cancellable, callback, user_data);
   g_task_set_source_tag (task, gs_plugin_aptkit_list_apps_async);
 
+  /* Reset the tried_safe_mode flag when listing apps */
+  self->tried_safe_mode = FALSE;
+
   if (query != NULL)
     is_for_updates = gs_app_query_get_is_for_update (query);
 
@@ -507,7 +552,10 @@ gs_plugin_aptkit_list_apps_async (GsPlugin *plugin,
   }
 
   if (is_for_updates == GS_APP_QUERY_TRISTATE_TRUE) {
-    g_debug ("Listing updates");
+    g_debug ("Listing updates in safe mode first");
+
+    /* Set safe mode flag */
+    g_object_set_data (G_OBJECT (task), "safe-mode", GINT_TO_POINTER (TRUE));
 
     g_task_set_task_data (task, GINT_TO_POINTER (ACTION_LIST_UPDATES), NULL);
     g_dbus_proxy_call (self->aptkit_proxy,
@@ -581,6 +629,7 @@ gs_plugin_aptkit_update_apps_async (GsPlugin *plugin,
 {
   GsPluginAptkit *self = GS_PLUGIN_APTKIT (plugin);
   g_autoptr(GTask) task = NULL;
+  gboolean safe_mode = TRUE;
 
   task = g_task_new (plugin, cancellable, callback, user_data);
   g_task_set_source_tag (task, gs_plugin_aptkit_update_apps_async);
@@ -591,6 +640,14 @@ gs_plugin_aptkit_update_apps_async (GsPlugin *plugin,
   }
 
   gs_plugin_status_update (plugin, NULL, GS_PLUGIN_STATUS_WAITING);
+
+  if (self->tried_safe_mode) {
+    /* If we've already tried safe mode and found no updates, turn it off */
+    safe_mode = FALSE;
+    g_debug ("Using non-safe mode for update since safe mode had no updates");
+  }
+
+  g_object_set_data (G_OBJECT (task), "safe-mode", GINT_TO_POINTER (safe_mode));
 
   gs_app_list_remove_all (self->updatable_apps);
   for (guint i = 0; i < gs_app_list_length (list); i++) {
@@ -605,10 +662,10 @@ gs_plugin_aptkit_update_apps_async (GsPlugin *plugin,
 
   g_task_set_task_data (task, GINT_TO_POINTER (ACTION_UPGRADE_SYSTEM), NULL);
 
-  g_debug ("Starting system update");
+  g_debug ("Starting system update with safe mode %s", safe_mode ? "on" : "off");
   g_dbus_proxy_call (self->aptkit_proxy,
                      "UpgradeSystem",
-                     g_variant_new ("(b)", TRUE),  /* safe mode */
+                     g_variant_new ("(b)", safe_mode),
                      G_DBUS_CALL_FLAGS_NONE,
                      -1,
                      cancellable,
@@ -625,6 +682,7 @@ gs_plugin_aptkit_init (GsPluginAptkit *self)
   gs_plugin_add_rule (plugin, GS_PLUGIN_RULE_RUN_BEFORE, "generic-updates");
 
   self->updatable_apps = gs_app_list_new ();
+  self->tried_safe_mode = FALSE;
 }
 
 static void
