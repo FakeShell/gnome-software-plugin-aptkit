@@ -460,6 +460,8 @@ static void
 gs_plugin_aptkit_refresh_metadata_async (GsPlugin *plugin,
                                          guint64 cache_age_secs,
                                          GsPluginRefreshMetadataFlags flags,
+                                         GsPluginEventCallback event_callback,
+                                         void *event_user_data,
                                          GCancellable *cancellable,
                                          GAsyncReadyCallback callback,
                                          gpointer user_data)
@@ -471,7 +473,6 @@ gs_plugin_aptkit_refresh_metadata_async (GsPlugin *plugin,
   g_task_set_source_tag (task, gs_plugin_aptkit_refresh_metadata_async);
 
   g_debug ("Refreshing repositories");
-  gs_plugin_status_update (plugin, NULL, GS_PLUGIN_STATUS_DOWNLOADING);
 
   g_dbus_proxy_call (self->aptkit_proxy,
                      "UpdateCache",
@@ -526,6 +527,8 @@ static void
 gs_plugin_aptkit_list_apps_async (GsPlugin *plugin,
                                   GsAppQuery *query,
                                   GsPluginListAppsFlags flags,
+                                  GsPluginEventCallback event_callback,
+                                  void *event_user_data,
                                   GCancellable *cancellable,
                                   GAsyncReadyCallback callback,
                                   gpointer user_data)
@@ -621,6 +624,8 @@ gs_plugin_aptkit_update_apps_async (GsPlugin *plugin,
                                     GsPluginUpdateAppsFlags flags,
                                     GsPluginProgressCallback progress_callback,
                                     gpointer progress_user_data,
+                                    GsPluginEventCallback event_callback,
+                                    void *event_user_data,
                                     GsPluginAppNeedsUserActionCallback app_needs_user_action_callback,
                                     gpointer app_needs_user_action_data,
                                     GCancellable *cancellable,
@@ -638,8 +643,6 @@ gs_plugin_aptkit_update_apps_async (GsPlugin *plugin,
     g_task_return_boolean (task, TRUE);
     return;
   }
-
-  gs_plugin_status_update (plugin, NULL, GS_PLUGIN_STATUS_WAITING);
 
   if (self->tried_safe_mode) {
     /* If we've already tried safe mode and found no updates, turn it off */
